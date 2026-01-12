@@ -1,0 +1,326 @@
+"""
+SCRIPT 2: NEURO PROCESSING ENGINE (ASR + SYNC)
+-------------------------------------------------------------------------
+1. Connects to streams named 'Muse-P1', 'Muse-P2', etc.
+2. CALIBRATION PHASE (60s): Collects raw data to learn clean signal topology.
+3. PROCESSING PHASE:
+   - Real-time ASR (Artifact Subspace Reconstruction) cleaning.
+   - FFT for Band Power.
+   - Rolling Z-Score Normalization (0.0 to 1.0).
+   - Inter-brain Synchronization (Similarity & Co-occurrence).
+4. Outputs OSC to local port 9000.
+
+HOW TO RUN:
+python 02_neuro_engine.py
+-------------------------------------------------------------------------
+"""
+
+import time
+import numpy as np
+from collections import deque
+from scipy.signal import welch, butter, lfilter
+from pythonosc import udp_client
+from pylsl import resolve_byprop, StreamInlet
+import mne
+# Note: asrpy must be installed: pip install asrpy
+try:
+    from asrpy import asr_calibrate, asr_process
+except ImportError:
+    print("CRITICAL: 'asrpy' not found. Install via pip or check environment.")
+    exit()
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
+# SYSTEM
+FS = 256                # Muse Sampling Rate
+OSC_IP = "127.0.0.1"
+OSC_PORT = 9000
+UPDATE_RATE = 10        # How many times per second we process/send OSC
+
+# SIGNAL PROCESSING
+WINDOW_SEC = 2.5        # FFT Window (2.5s)
+STEP_SEC = 0.1          # Overlap/Slide speed
+CALIBRATION_SEC = 60    # Time to record baseline for ASR cleaning
+BUFFER_LEN = int(FS * WINDOW_SEC)
+
+# NORMALIZATION
+Z_WINDOW = 300          # How many processing steps to keep for Z-score history (approx 30s)
+
+# FREQUENCY BANDS
+BANDS = {
+    "Delta": (0.5, 4),
+    "Theta": (4, 8),
+    "Alpha": (8, 13),
+    "Beta":  (13, 30),
+    "Gamma": (30, 45)
+}
+
+# CHANNEL WEIGHTS (Frontal vs Temporal)
+# We weigh frontal lobes higher for Focus/Calm detection
+CH_WEIGHTS = np.array([0.2, 0.3, 0.3, 0.2]) # TP9, AF7, AF8, TP10
+
+# ==========================================
+# MATH & SIGNAL HELPERS
+# ==========================================
+
+def create_filters():
+    """Create Bandpass (1-50Hz) and Notch (60Hz) filters."""
+    nyq = 0.5 * FS
+    # Bandpass
+    b_bp, a_bp = butter(4, [1.0/nyq, 50.0/nyq], btype='band')
+    # Notch (Change 60.0 to 50.0 for Europe)
+    b_notch, a_notch = butter(4, [58.0/nyq, 62.0/nyq], btype='bandstop')
+    return (b_bp, a_bp), (b_notch, a_notch)
+
+def apply_filters(data, filters):
+    """Apply filters to raw numpy array."""
+    (b_bp, a_bp), (b_notch, a_notch) = filters
+    # Apply bandpass then notch
+    d = lfilter(b_bp, a_bp, data, axis=0) # Filter along time axis
+    d = lfilter(b_notch, a_notch, d, axis=0)
+    return d
+
+def normalize_z_score(val, history):
+    """
+    Convert raw value to 0-1 range using rolling history.
+    Z = (val - mean) / std
+    Output = Sigmoid(Z) to smooth it between 0 and 1.
+    """
+    if len(history) < 10: return 0.5 # Not enough data yet
+    
+    mu = np.mean(history)
+    sigma = np.std(history) + 1e-6 # Avoid div by zero
+    
+    z = (val - mu) / sigma
+    
+    # Sigmoid function to squash Z (-3 to +3) into (0.0 to 1.0)
+    return 1 / (1 + np.exp(-z))
+
+# ==========================================
+# WORKER CLASS (One per Headset)
+# ==========================================
+
+class MuseWorker:
+    def __init__(self, inlet, p_id):
+        self.inlet = inlet
+        self.id = p_id
+        
+        # Raw Data Buffer (Numpy Ring Buffer)
+        self.buffer = np.zeros((BUFFER_LEN, 4)) 
+        self.timestamps = np.zeros(BUFFER_LEN)
+        
+        # ASR State
+        self.calibrating = True
+        self.calibration_buffer = [] # Grow list until 60s
+        self.M = None # ASR Mixing Matrix
+        self.T = None # ASR Threshold Matrix
+        
+        # History for Normalization (Deque is efficient for rolling stats)
+        self.history_alpha = deque(maxlen=Z_WINDOW)
+        self.history_calm = deque(maxlen=Z_WINDOW)
+        
+        # Latest computed metric (for Group Sync)
+        self.current_calm = 0.5
+
+    def process(self, filters):
+        # 1. Pull Data
+        # We pull everything available to clear the LSL buffer
+        chunk, ts = self.inlet.pull_chunk(timeout=0.0)
+        
+        if chunk:
+            # Convert to numpy (Time x Channels)
+            chunk_np = np.array(chunk)[:, :4] # Keep first 4 channels only
+            
+            # --- PHASE 1: CALIBRATION ---
+            if self.calibrating:
+                # Accumulate data
+                self.calibration_buffer.append(chunk_np)
+                
+                # Check if we have 60 seconds
+                total_samples = sum(len(c) for c in self.calibration_buffer)
+                if total_samples >= CALIBRATION_SEC * FS:
+                    print(f"[{self.id}] Calibration Complete. Fitting ASR...")
+                    self.fit_asr()
+                    self.calibrating = False
+                return None # No processing output during calibration
+
+            # --- PHASE 2: RUNTIME PROCESSING ---
+            
+            # Add to ring buffer
+            # Roll buffer back by N samples, insert new N samples at end
+            n_new = len(chunk_np)
+            if n_new > BUFFER_LEN: 
+                chunk_np = chunk_np[-BUFFER_LEN:] # Handle overflow
+                n_new = BUFFER_LEN
+                
+            self.buffer = np.roll(self.buffer, -n_new, axis=0)
+            self.buffer[-n_new:] = chunk_np
+            
+            # 2. Filter (Bandpass + Notch)
+            filtered_data = apply_filters(self.buffer, filters)
+            
+            # 3. Clean (ASR)
+            # ASR typically needs MNE raw objects, but asr_process can take numpy
+            # if we are careful. However, standard library expects (Channels x Time).
+            # Our buffer is (Time x Channels), so we Transpose (.T)
+            try:
+                clean_data = asr_process(filtered_data.T, FS, self.M, self.T)
+                clean_data = clean_data.T # Transpose back to (Time x Ch)
+            except Exception as e:
+                print(f"ASR Error: {e}")
+                clean_data = filtered_data # Fallback if ASR fails
+            
+            # 4. Feature Extraction (FFT via Welch)
+            # Calculate PSD (Power Spectral Density)
+            freqs, psd = welch(clean_data, FS, nperseg=FS, axis=0)
+            
+            # 5. Calculate Band Powers
+            powers = {}
+            for band, (low, high) in BANDS.items():
+                # Find indices for this band
+                idx = np.logical_and(freqs >= low, freqs <= high)
+                # Mean power across the band, then Weighted Mean across channels
+                band_power_per_chan = np.mean(psd[idx, :], axis=0)
+                # Apply channel weights (Focus on Frontal)
+                weighted_power = np.average(band_power_per_chan, weights=CH_WEIGHTS)
+                powers[band] = weighted_power
+
+            # 6. Compute Calmness (Alpha / Beta Ratio)
+            # Add epsilon to prevent div by 0
+            raw_calm = (powers['Alpha'] + 1e-6) / (powers['Beta'] + 1e-6)
+            
+            # 7. Normalization (Z-Score -> 0-1)
+            self.history_alpha.append(powers['Alpha'])
+            self.history_calm.append(raw_calm)
+            
+            norm_alpha = normalize_z_score(powers['Alpha'], self.history_alpha)
+            norm_calm = normalize_z_score(raw_calm, self.history_calm)
+            
+            self.current_calm = norm_calm
+            
+            return {
+                "alpha_raw": powers['Alpha'],
+                "alpha_norm": norm_alpha,
+                "calm_norm": norm_calm,
+                "is_clean": True # Flag placeholder
+            }
+            
+        return None
+
+    def fit_asr(self):
+        """Fit the ASR method on the collected calibration data."""
+        # Merge list of chunks into one big array
+        full_calib_data = np.concatenate(self.calibration_buffer, axis=0)
+        
+        # ASR requires MNE Raw object for calibration usually
+        # We create a dummy MNE info
+        info = mne.create_info(ch_names=['TP9','AF7','AF8','TP10'], sfreq=FS, ch_types='eeg')
+        raw = mne.io.RawArray(full_calib_data.T, info, verbose=False)
+        
+        # Run Calibration
+        # This computes the statistical properties of "clean" data
+        try:
+            self.M, self.T = asr_calibrate(raw, FS, cutoff=20) # Cutoff=20 is standard for cleaning
+            print(f"[{self.id}] ASR FITTED SUCCESSFULLY.")
+        except Exception as e:
+            print(f"[{self.id}] ASR Fit Failed: {e}. Processing will be uncleaned.")
+            self.M, self.T = None, None
+            
+        # Clear memory
+        self.calibration_buffer = []
+
+# ==========================================
+# MAIN ENGINE
+# ==========================================
+
+def main():
+    print("=== NEURO PROCESSING ENGINE STARTED ===")
+    
+    # 1. Setup OSC
+    client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
+    print(f"Sending OSC to {OSC_IP}:{OSC_PORT}")
+    
+    # 2. Setup Filters
+    filters = create_filters()
+    
+    # 3. Resolve Streams
+    print("Looking for LSL streams...")
+    streams = resolve_byprop("type", "EEG", timeout=10)
+    
+    if not streams:
+        print("No EEG streams found. Did you run the Streamer script?")
+        return
+
+    workers = []
+    
+    # 4. Initialize Workers
+    for s in streams:
+        # Check name to see if it's one we manage
+        s_name = s.name() # e.g., Muse-P1
+        print(f"Found stream: {s_name}")
+        
+        inlet = StreamInlet(s)
+        # Parse ID from name (Muse-P1 -> P1) or default to index
+        p_id = s_name.split('-')[-1] if '-' in s_name else f"P{len(workers)+1}"
+        
+        w = MuseWorker(inlet, p_id)
+        workers.append(w)
+
+    print(f"Attached {len(workers)} processing workers.")
+    print("Starting Main Loop. (First 60s is Calibration - No OSC output)")
+
+    try:
+        while True:
+            cycle_start = time.time()
+            
+            # --- PROCESS INDIVIDUAL HEADSETS ---
+            active_calm_values = []
+            
+            for w in workers:
+                data = w.process(filters)
+                
+                # If we got data back (and not just calibrating)
+                if data:
+                    base = f"/eeg/{w.id}"
+                    
+                    # Send individual metrics
+                    client.send_message(f"{base}/alpha", data['alpha_norm'])
+                    client.send_message(f"{base}/calm", data['calm_norm'])
+                    
+                    # Store for group calculation
+                    active_calm_values.append(data['calm_norm'])
+                
+                elif w.calibrating:
+                    # Optional: Send "Calibrating" flag
+                    client.send_message(f"/eeg/{w.id}/status", 0) # 0 = Calibrating
+
+            # --- PROCESS GROUP SYNCHRONY ---
+            # Metric 1: Similarity (Inverse Variance)
+            # If values are [0.8, 0.82], variance is low -> High Sync
+            # If values are [0.1, 0.9], variance is high -> Low Sync
+            
+            if len(active_calm_values) > 1:
+                # Variance of 0.0 means perfect sync
+                # Max variance for 0-1 range is 0.25 (0 vs 1)
+                variance = np.var(active_calm_values)
+                
+                # Invert logic: 1.0 = Perfect Sync, 0.0 = Chaos
+                sync_score = 1.0 - (variance * 4.0) 
+                sync_score = max(0.0, min(1.0, sync_score)) # Clamp
+                
+                client.send_message("/eeg/group/sync", sync_score)
+                client.send_message("/eeg/group/avg_calm", np.mean(active_calm_values))
+                
+            # Rate Limiting
+            elapsed = time.time() - cycle_start
+            sleep_time = (1.0/UPDATE_RATE) - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        print("\nEngine stopping.")
+
+if __name__ == "__main__":
+    main()
