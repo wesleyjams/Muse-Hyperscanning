@@ -1,0 +1,88 @@
+"""
+SCRIPT 1: MULTI-MUSE MANAGER
+-------------------------------------------------------------------------
+1. Scans for all available Bluetooth Muse devices.
+2. Sorts them (by signal strength or address) to maintain consistent ordering.
+3. Launches a separate 'muselsl stream' subprocess for each device.
+4. Ensures no latency overlap by assigning unique LSL names (Muse-P1, Muse-P2).
+
+HOW TO RUN:
+python 01_muse_manager.py
+-------------------------------------------------------------------------
+"""
+
+import sys
+import time
+import subprocess
+from muselsl import list_muses
+
+def main():
+    print("=== MULTI-MUSE CONNECTION MANAGER ===")
+    print("Scanning for devices (this takes 10-15 seconds)...")
+
+    # 1. SCAN DEVICES
+    # backend='bleak' is standard for modern macOS/Windows
+    muses = list_muses(backend='bleak')
+
+    if not muses:
+        print("No Muses found. Check Bluetooth and ensure headsets are in pairing mode.")
+        sys.exit(1)
+
+    print(f"\nFound {len(muses)} device(s):")
+    for i, muse in enumerate(muses):
+        print(f"  [{i+1}] {muse['name']} ({muse['address']})")
+
+    # 2. CONFIGURATION
+    confirm = input(f"\nConnect to all {len(muses)} devices? (y/n): ")
+    if confirm.lower() != 'y':
+        print("Aborting.")
+        sys.exit(0)
+
+    processes = []
+
+    # 3. LAUNCH STREAMS
+    # We spawn a separate subprocess for each headset. 
+    # This prevents one laggy bluetooth connection from freezing the others.
+    print("\nLaunching Stream Threads...")
+    
+    for i, muse in enumerate(muses):
+        # We assign a logical ID: P1, P2, P3...
+        # The LSL stream name will be 'Muse-P1', 'Muse-P2', etc.
+        p_id = f"Muse-P{i+1}"
+        
+        print(f"--> Starting stream for {p_id} on {muse['address']}...")
+        
+        # Construct the command line argument for muselsl
+        # equivalent to: muselsl stream --address X --name Muse-P1
+        cmd = [
+            sys.executable, "-m", "muselsl", "stream",
+            "--address", muse['address'],
+            "--name", p_id
+        ]
+        
+        # Launch subprocess
+        proc = subprocess.Popen(cmd)
+        processes.append(proc)
+        
+        # Stagger start times slightly to prevent Bluetooth congestion
+        time.sleep(2)
+
+    print(f"\nAll {len(processes)} headsets are streaming.")
+    print("Keep this window open. Press Ctrl+C to stop all streams.")
+
+    # 4. MONITOR LOOP
+    try:
+        while True:
+            time.sleep(1)
+            # Check if any process died
+            for i, p in enumerate(processes):
+                if p.poll() is not None:
+                    print(f"Warning: Stream P{i+1} has stopped unexpectedly.")
+    except KeyboardInterrupt:
+        print("\nStopping all streams...")
+        for p in processes:
+            p.terminate()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
